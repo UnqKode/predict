@@ -3,4 +3,7 @@ numpy
 pandas
 matplotlib
 geopy
-DSSATTools==2.1.6 
+fastapi
+uvicorn
+DSSATTools==2.1.6
+
