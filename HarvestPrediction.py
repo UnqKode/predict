@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-dssat_orchestrator.py
+dssat_orchestrator_minimal.py
 
-Unified pipeline with verbose terminal prints so user sees stage-by-stage progress.
-Usage examples:
-  python dssat_orchestrator.py --pin 302031 --planting 2025-05-14 --crop wheat
-  python dssat_orchestrator.py --latlon 26.90 75.90 --planting 2025-05-14 --crop wheat
+Minimal orchestrator: runs DSSAT once and prints ONLY:
+  Predicted maturity date: YYYY-MM-DD
+  Predicted yield (kg/ha): <value>
+
+No files/folders are created and no other terminal output is produced.
 """
 
-import os
 import sys
 import argparse
 import time
@@ -20,15 +20,15 @@ import json
 import requests
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
+# plotting and file IO removed intentionally
 # DSSATTools binding (must be on PYTHONPATH)
 try:
     from DSSATTools import DSSAT, Crop, SoilProfile, Weather, Management
-except Exception as e:
-    print("ERROR: Could not import DSSATTools. Ensure DSSATTools is installed and available on PYTHONPATH.")
-    print("Exception:", e)
-    sys.exit(1)
+except Exception:
+    # If DSSATTools isn't importable, we cannot proceed.
+    # We intentionally do not print diagnostic lines here (per user's request).
+    raise
 
 # optional geocoding
 try:
@@ -37,15 +37,6 @@ except Exception:
     Nominatim = None
 
 # ---------- CONFIG ----------
-OUT_BASE = "Final_Yield_outputs_1.0"
-SOL_DIR = os.path.join(OUT_BASE, "sol_files")
-WTH_DIR = os.path.join(OUT_BASE, "wth_files")
-PLOT_DIR = os.path.join(OUT_BASE, "plots")
-CSV_DIR = os.path.join(OUT_BASE, "csv")
-LOG_DIR = os.path.join(OUT_BASE, "logs")
-for d in (OUT_BASE, SOL_DIR, WTH_DIR, PLOT_DIR, CSV_DIR, LOG_DIR):
-    os.makedirs(d, exist_ok=True)
-
 WARMUP_DAYS = 30
 DEFAULT_GROWTH_DAYS = 160
 SOILGRIDS_DEPTHS = ["0-5cm", "5-15cm", "15-30cm"]
@@ -58,14 +49,11 @@ SOILGRIDS_BASE = "https://rest.isric.org/soilgrids/v2.0/properties/query"
 def geocode_pin(pin):
     """Return (lat, lon) for given Indian PIN using Nominatim (if available)."""
     if Nominatim is None:
-        raise RuntimeError("geopy not installed; cannot geocode. Install with `pip install geopy` or pass lat/lon manually.")
+        raise RuntimeError("geopy not installed; cannot geocode.")
     geolocator = Nominatim(user_agent="dssat_pin_geocoder")
-    q = f"{pin}, India"
-    print(f"[GEOCODE] Looking up PIN '{pin}' via Nominatim...")
-    loc = geolocator.geocode(q, timeout=15)
+    loc = geolocator.geocode(f"{pin}, India", timeout=15)
     if loc is None:
         raise RuntimeError(f"Geocoding failed for PIN {pin}.")
-    print(f"[GEOCODE] Found location: {loc.address} (lat={loc.latitude:.6f}, lon={loc.longitude:.6f})")
     return float(loc.latitude), float(loc.longitude)
 
 def _parse_depth_label_to_bottom_mm(label):
@@ -77,7 +65,6 @@ def _parse_depth_label_to_bottom_mm(label):
 
 def fetch_soilgrids_properties(lat, lon, properties=("sand","silt","clay","soc","bdod"), depths=SOILGRIDS_DEPTHS):
     """Query SoilGrids; returns list of dicts per depth (properties as floats)."""
-    print(f"[SOIL] Fetching SoilGrids properties for lat={lat:.4f}, lon={lon:.4f} ...")
     params = {
         "lon": lon,
         "lat": lat,
@@ -102,7 +89,7 @@ def fetch_soilgrids_properties(lat, lon, properties=("sand","silt","clay","soc",
 
     layers_out = []
     for depth_label in depths:
-        row = {p: np.nan for p in properties}
+        row = {p: float("nan") for p in properties}
         for p in properties:
             info = prop_entries.get(p)
             if not info:
@@ -137,21 +124,20 @@ def fetch_soilgrids_properties(lat, lon, properties=("sand","silt","clay","soc",
                                 break
                             except Exception:
                                 pass
-        for k in row:
+        for k in list(row.keys()):
             try:
                 row[k] = float(row[k])
             except Exception:
-                row[k] = np.nan
+                row[k] = float("nan")
         layers_out.append(row)
 
     # heuristic: scale down weird large numbers
     for layer in layers_out:
         for k in list(layer.keys()):
             v = layer[k]
-            if not np.isnan(v) and v > 100:
+            if not (isinstance(v, float) and np.isnan(v)) and v > 100:
                 layer[k] = v / 10.0
 
-    print(f"[SOIL] Parsed SoilGrids layers: {layers_out}")
     return layers_out
 
 def texture_to_dssat_class(sand, silt, clay):
@@ -167,57 +153,6 @@ def texture_to_dssat_class(sand, silt, clay):
         return "SL"
     return "L"
 
-def write_simple_sol(layers, lat, lon, out_path, depth_labels=SOILGRIDS_DEPTHS):
-    print(f"[SOL] Writing .SOL file to: {out_path} ...")
-    def compute_mm_depths(labels, n_layers):
-        mm = []
-        for i, lab in enumerate(labels[:n_layers]):
-            bottom_mm = _parse_depth_label_to_bottom_mm(lab)
-            if bottom_mm is None:
-                seq = [50, 150, 300, 600, 1200]
-                bottom_mm = seq[i] if i < len(seq) else seq[-1]
-            mm.append(bottom_mm)
-        while len(mm) < n_layers:
-            mm.append(mm[-1] * 2)
-        return mm
-
-    with open(out_path, "w") as f:
-        f.write("*SOILS: Auto-generated from SoilGrids (approximate)\n")
-        f.write("@SITE        COUNTRY  LAT     LONG    SCS FAMILY\n")
-        f.write(f"AUTO_{int(time.time())}    INDIA    {lat:.4f}  {lon:.4f}  Generated\n\n")
-        f.write("@SLB  SLLL  SDUL  SSAT  SBDM  SLOC  SAND  SILT  CLAY\n")
-        n_layers = len(layers)
-        mm_depths = compute_mm_depths(depth_labels, n_layers)
-        for i, layer in enumerate(layers):
-            sand = layer.get("sand", np.nan)
-            silt = layer.get("silt", np.nan)
-            clay = layer.get("clay", np.nan)
-            bdod = layer.get("bdod", np.nan)
-            soc = layer.get("soc", np.nan)
-
-            if not np.isnan(soc):
-                soc_pct = soc / 10.0 if soc > 10 else soc
-            else:
-                soc_pct = 0.5
-
-            ssat = 0.45
-            if not np.isnan(bdod) and bdod > 0:
-                ssat = max(0.25, min(0.60, 1.0 - bdod / 2.65))
-
-            if np.isnan(clay):
-                slll = 0.10
-            else:
-                slll = 0.08 + 0.001 * float(clay)
-                slll = max(0.05, min(0.30, slll))
-
-            sdul = min(ssat - 0.02, slll + 0.15)
-            bd = bdod if not np.isnan(bdod) and bdod > 0 else 1.30
-
-            f.write(f"{mm_depths[i]:4d}  {slll:.3f}  {sdul:.3f}  {ssat:.3f}  {bd:.3f}  {soc_pct:.3f}  "
-                    f"{(sand if not np.isnan(sand) else 0):5.1f}  {(silt if not np.isnan(silt) else 0):5.1f}  {(clay if not np.isnan(clay) else 0):5.1f}\n")
-    print(f"[SOL] .SOL file written: {out_path}")
-    return out_path
-
 # ---------- Helpers (weather) ----------
 def sanitize_rhum(s):
     s2 = s.copy()
@@ -228,7 +163,6 @@ def sanitize_rhum(s):
 def fetch_open_meteo_range(lat, lon, start_date, end_date, timezone="Asia/Kolkata"):
     sd = pd.to_datetime(start_date).strftime("%Y-%m-%d")
     ed = pd.to_datetime(end_date).strftime("%Y-%m-%d")
-    print(f"[WEATHER] Fetching Open-Meteo archive: {sd} -> {ed}")
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -243,7 +177,6 @@ def fetch_open_meteo_range(lat, lon, start_date, end_date, timezone="Asia/Kolkat
     j = r.json()
     daily = j.get("daily", {})
     if not daily:
-        print("[WEATHER] Open-Meteo returned no daily data for requested range.")
         return pd.DataFrame(columns=["TMIN","TMAX","RAIN","SRAD","RHUM"])
     dates = pd.to_datetime(daily["time"])
     df = pd.DataFrame(index=dates)
@@ -263,11 +196,9 @@ def fetch_open_meteo_range(lat, lon, start_date, end_date, timezone="Asia/Kolkat
     else:
         df["RHUM"] = np.nan
     df["RHUM"] = sanitize_rhum(df["RHUM"])
-    print(f"[WEATHER] Retrieved {len(df)} days of archive weather.")
     return df
 
 def fetch_open_meteo_forecast(lat, lon, days=7, timezone="Asia/Kolkata"):
-    print(f"[WEATHER] Fetching Open-Meteo forecast ({days} days)...")
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -280,7 +211,6 @@ def fetch_open_meteo_forecast(lat, lon, days=7, timezone="Asia/Kolkata"):
     j = r.json()
     daily = j.get("daily", {})
     if not daily:
-        print("[WEATHER] Open-Meteo forecast returned no daily data.")
         return pd.DataFrame(columns=["TMIN","TMAX","RAIN","SRAD","RHUM"])
     dates = pd.to_datetime(daily["time"])
     df = pd.DataFrame(index=dates)
@@ -302,11 +232,9 @@ def fetch_open_meteo_forecast(lat, lon, days=7, timezone="Asia/Kolkata"):
     df["RHUM"] = sanitize_rhum(df["RHUM"])
     if len(df) > days:
         df = df.iloc[:days]
-    print(f"[WEATHER] Retrieved {len(df)} days of forecast.")
     return df
 
 def build_tmy_from_past_years(lat, lon, start_date, end_date, years=5):
-    print(f"[WEATHER] Building TMY from last {years} years for {start_date.date()} -> {end_date.date()} ...")
     frames = []
     today = datetime.now().date()
     for y in range(today.year - years, today.year):
@@ -324,7 +252,6 @@ def build_tmy_from_past_years(lat, lon, start_date, end_date, years=5):
         except Exception:
             continue
     if not frames:
-        print("[WEATHER] No historical frames found; using synthetic default weather for TMY.")
         days = (end_date - start_date).days + 1
         dates = pd.date_range(start_date, periods=days, freq="D")
         df = pd.DataFrame({
@@ -352,11 +279,9 @@ def build_tmy_from_past_years(lat, lon, start_date, end_date, years=5):
         stacked.append(df2)
     avg = pd.concat(stacked).groupby(level=0).mean()
     avg["RHUM"] = sanitize_rhum(avg["RHUM"])
-    print(f"[WEATHER] Built TMY with {len(avg)} days.")
     return avg
 
 def stitch_weather(past_df, forecast_df, tmy_df):
-    print("[WEATHER] Stitching past + forecast + TMY into a continuous daily series...")
     parts = []
     if past_df is not None and not past_df.empty:
         parts.append(past_df)
@@ -372,28 +297,75 @@ def stitch_weather(past_df, forecast_df, tmy_df):
     df = df.asfreq("D")
     df = df.ffill().bfill()
     df["RHUM"] = sanitize_rhum(df["RHUM"])
-    print(f"[WEATHER] Stitched weather has {len(df)} days from {df.index.min().date()} -> {df.index.max().date()}.")
     return df
 
 # ---------- Management & maturity helpers ----------
-def random_management(planting_date):
-    print("[MGMT] Creating default/randomized Management object.")
+def random_management(planting_date, crop_name=None, defaults=None):
+    """
+    Create a Management object with small randomization and ensure crop-specific
+    required planting params (e.g. PLWT and SPRL for potato) are present.
+    No prints, no file writes.
+    """
+    defaults = defaults or {}
+    if isinstance(planting_date, str):
+        try:
+            planting_date = datetime.strptime(planting_date, "%Y-%m-%d")
+        except Exception:
+            pass
+
     m = Management(planting_date=planting_date)
+
+    # Ensure a dict-like planting_details
+    try:
+        if not hasattr(m, "planting_details") or m.planting_details is None:
+            m.planting_details = {}
+    except Exception:
+        try:
+            setattr(m, "planting_details", {})
+        except Exception:
+            # if unable to set, proceed — DSSATTools may still accept Management as-is
+            pass
+
+    # Randomize PLRS if possible
     try:
         from numpy.random import default_rng
         rng = default_rng()
-        rs = int(rng.integers(20, 46))
-        if hasattr(m, "planting_details"):
+        rs = int(defaults.get("PLRS", rng.integers(20, 46)))
+        if isinstance(m.planting_details, dict):
+            m.planting_details.setdefault("PLRS", rs)
+        else:
             try:
-                m.planting_details.update({"PLRS": rs})
+                m.planting_details["PLRS"] = rs
             except Exception:
-                try:
-                    m.planting_details["PLRS"] = rs
-                except Exception:
-                    pass
+                pass
     except Exception:
         pass
-    print(f"[MGMT] Management prepared (PLRS randomised if supported).")
+
+    # Crop-specific mandatory parameters
+    if crop_name and isinstance(crop_name, str) and crop_name.strip().lower() in ("potato", "potatoes"):
+        plwt_default = defaults.get("PLWT", 2.5)
+        sprl_default = defaults.get("SPRL", 3.0)
+        try:
+            if isinstance(m.planting_details, dict):
+                m.planting_details.setdefault("PLWT", float(plwt_default))
+                m.planting_details.setdefault("SPRL", float(sprl_default))
+            else:
+                try:
+                    m.planting_details["PLWT"] = float(plwt_default)
+                    m.planting_details["SPRL"] = float(sprl_default)
+                except Exception:
+                    try:
+                        setattr(m, "planting_details", {"PLWT": float(plwt_default), "SPRL": float(sprl_default)})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Apply any other defaults (without overwriting)
+    if isinstance(m.planting_details, dict):
+        for k, v in defaults.items():
+            m.planting_details.setdefault(k, v)
+
     return m
 
 def parse_mdat_from_summary(summary_df, planting_date):
@@ -451,25 +423,25 @@ def detect_maturity_from_plantgro(plantgro_df, planting_date, crop_name):
     return (None, None)
 
 # ---------- Orchestrator ----------
-def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="wheat", out_base=OUT_BASE):
-    """Top-level function to run the whole pipeline once. Returns dict summary."""
-    os.makedirs(out_base, exist_ok=True)
-    csv_path = None
-    wth_out = None
-    sol_path = None
-
+def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="wheat"):
+    """
+    Run the pipeline and return a dict with keys:
+      - predicted_maturity_date (str or None)
+      - predicted_yield_kg_ha (float or None)
+      - ok (bool)
+      - error (str) optional if not ok
+    No file writes. No prints.
+    """
     try:
-        print("[RUN] Starting pipeline...")
         # 1) geocode or use latlon
         if pin:
             try:
                 lat, lon = geocode_pin(pin)
-            except Exception as e:
-                print("[GEOCODE] Geocoding failed; falling back to approximate default coordinates for the PIN. Error:", e)
+            except Exception:
+                # fallback coordinate if geocoding fails
                 lat, lon = 26.90, 75.90
         elif latlon:
             lat, lon = float(latlon[0]), float(latlon[1])
-            print(f"[INPUT] Using provided lat/lon {lat:.4f}, {lon:.4f}")
         else:
             raise ValueError("Either pin or latlon must be provided.")
 
@@ -479,19 +451,9 @@ def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="whe
             topvals = layers[0] if layers else None
             if topvals is None or all(np.isnan(v) for v in topvals.values()):
                 raise RuntimeError("SoilGrids returned empty for top layer.")
-            print("[SOIL] SoilGrids fetch successful.")
-        except Exception as e:
-            print("[SOIL] SoilGrid fetch failed; using fallback generic soil. Error:", e)
+        except Exception:
+            # fallback generic soil
             layers = [{"sand":30.0,"silt":40.0,"clay":30.0,"bdod":1.35,"soc":0.6} for _ in range(3)]
-
-        sol_name = f"soil_{int(time.time())}.SOL"
-        sol_dir = os.path.join(out_base, "sol_files")
-        os.makedirs(sol_dir, exist_ok=True)
-        sol_path = os.path.join(sol_dir, sol_name)
-        try:
-            write_simple_sol(layers, lat, lon, sol_path)
-        except Exception as e:
-            print("[SOL] Warning: failed to write SOL file:", e)
 
         # 3) weather: past (planting-warmup -> yesterday), forecast (7d), then TMY to cover growth
         planting_date = datetime.strptime(planting_date_str, "%Y-%m-%d")
@@ -503,21 +465,12 @@ def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="whe
         if past_start <= yesterday:
             try:
                 past_df = fetch_open_meteo_range(lat, lon, past_start, yesterday)
-                print(f"[WEATHER] Fetched past weather: {past_df.index.min().date()} -> {past_df.index.max().date()} ({len(past_df)} days)")
-            except Exception as e:
-                print("[WEATHER] Warning: failed to fetch past weather:", e)
+            except Exception:
                 past_df = pd.DataFrame()
-        else:
-            print("[WEATHER] No past weather fetch required (planting in the future + warmup).")
 
         try:
             forecast_df = fetch_open_meteo_forecast(lat, lon, days=7)
-            if not forecast_df.empty:
-                print(f"[WEATHER] Forecast fetched: {forecast_df.index.min().date()} -> {forecast_df.index.max().date()}")
-            else:
-                print("[WEATHER] Forecast empty.")
-        except Exception as e:
-            print("[WEATHER] Warning: failed to fetch forecast:", e)
+        except Exception:
             forecast_df = pd.DataFrame()
 
         forecast_end = forecast_df.index.max().date() if not forecast_df.empty else (datetime.now().date() + timedelta(days=6))
@@ -527,12 +480,8 @@ def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="whe
         if tmy_start <= tmy_end:
             try:
                 tmy_df = build_tmy_from_past_years(lat, lon, datetime.combine(tmy_start, datetime.min.time()), datetime.combine(tmy_end, datetime.min.time()))
-                print("[WEATHER] TMY built successfully.")
-            except Exception as e:
-                print("[WEATHER] Warning: failed to build TMY:", e)
+            except Exception:
                 tmy_df = pd.DataFrame()
-        else:
-            print("[WEATHER] No TMY needed (forecast covers the required period).")
 
         # stitch weather
         try:
@@ -545,15 +494,8 @@ def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="whe
                 last_row = stitched.iloc[-1]
                 extra = pd.DataFrame([last_row.values]*add_days, index=extra_idx, columns=stitched.columns)
                 stitched = pd.concat([stitched, extra])
-                print(f"[WEATHER] Extended stitched weather by {add_days} days to cover simulation horizon.")
-            # save stitched CSV
-            wth_out = os.path.join(out_base, "wth_files", f"weather_{lat:.4f}_{lon:.4f}_{planting_date_str}.csv")
-            stitched.to_csv(wth_out, index=True)
-            print(f"[WEATHER] Saved stitched weather CSV: {wth_out}")
-        except Exception as e:
-            print("[WEATHER] ERROR: could not stitch weather:", e)
-            # fallback to a generated random weather for simulation continuity:
-            print("[WEATHER] Falling back to generated random weather.")
+        except Exception:
+            # fallback to generated random weather if stitching fails
             total_days = WARMUP_DAYS + DEFAULT_GROWTH_DAYS
             start_date = planting_date - timedelta(days=WARMUP_DAYS)
             dates = pd.date_range(start_date, periods=total_days, freq="D")
@@ -565,45 +507,33 @@ def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="whe
                 "RAIN": np.round(np.where(rng.random(size=total_days) < 0.25, rng.exponential(scale=6.0,size=total_days), 0.0),3),
                 "RHUM": np.round(rng.uniform(40,95,size=total_days),1)
             }, index=dates)
-            wth_out = os.path.join(out_base, "wth_files", f"weather_random_{int(time.time())}.csv")
-            stitched.to_csv(wth_out, index=True)
-            print(f"[WEATHER] Saved fallback random weather CSV: {wth_out}")
 
         # 4) prepare DSSAT objects
         mapping = {"TMIN":"TMIN","TMAX":"TMAX","RAIN":"RAIN","SRAD":"SRAD","RHUM":"RHUM"}
-        print("[DSSAT] Building Weather object for DSSAT...")
         weather_obj = Weather(stitched, mapping, lat, lon, elev=0)
-        print("[DSSAT] Weather object built.")
 
-        # SoilProfile: create from topsoil class (safe default)
+        # SoilProfile
         try:
             top = layers[0] if layers else {"sand":30,"silt":40,"clay":30}
-            dssat_soil_class = texture_to_dssat_class(top.get("sand",np.nan), top.get("silt",np.nan), top.get("clay",np.nan))
+            dssat_soil_class = texture_to_dssat_class(top.get("sand",float("nan")), top.get("silt",float("nan")), top.get("clay",float("nan")))
             soil = SoilProfile(default_class=dssat_soil_class)
-            print(f"[DSSAT] SoilProfile created with default_class='{dssat_soil_class}'.")
         except Exception:
             soil = SoilProfile(default_class="SIL")
-            print("[DSSAT] SoilProfile creation failed; used default_class='SIL'.")
 
-        management = random_management(planting_date)
+        management = random_management(planting_date, crop_name=crop_name)
 
         # 5) run DSSAT once
         dssat = DSSAT()
         try:
-            print(f"[DSSAT] Running DSSAT for crop='{crop_name}', planting_date='{planting_date_str}' ...")
             dssat.run(soil, weather_obj, Crop(crop_name), management)
-            print("[DSSAT] DSSAT run completed successfully.")
         except Exception:
-            print("[DSSAT] DSSAT run failed; traceback:")
-            traceback.print_exc()
             try:
                 dssat.close()
             except Exception:
                 pass
-            return {"ok": False, "error": "DSSAT run failed. See logs."}
+            return {"ok": False, "error": "DSSAT run failed."}
 
         # 6) parse outputs
-        print("[DSSAT] Parsing outputs...")
         summary_df = dssat.output.get("Summary")
         plantgro = dssat.output.get("PlantGro")
         maturity_date = None
@@ -631,7 +561,6 @@ def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="whe
             if plantgro is not None:
                 maturity_date, maturity_row = detect_maturity_from_plantgro(plantgro, planting_date, crop_name)
 
-        # yield extraction
         predicted_yield = None
         target_col = "HWAD" if crop_name.lower() == "wheat" else "GWAD"
         if plantgro is not None and target_col in plantgro.columns:
@@ -652,101 +581,52 @@ def run_for_farmer(pin=None, latlon=None, planting_date_str=None, crop_name="whe
                     except Exception:
                         pass
 
-        print("[DSSAT] Output parsing complete.")
-
-        # save outputs: PlantGro CSV + plots
-        if plantgro is not None and not plantgro.empty:
-            # ensure datetime index
-            if not pd.api.types.is_datetime64_any_dtype(plantgro.index):
-                if "DATE" in plantgro.columns:
-                    plantgro.index = pd.to_datetime(plantgro["DATE"])
-                else:
-                    plantgro.index = pd.date_range(planting_date - timedelta(days=WARMUP_DAYS), periods=len(plantgro), freq="D")
-            csv_path = os.path.join(out_base, "csv", f"PlantGro_{crop_name}_{lat:.4f}_{lon:.4f}_{planting_date_str}.csv")
-            plantgro.to_csv(csv_path, index=True)
-            print(f"[OUTPUT] Saved PlantGro CSV: {csv_path}")
-            preferred = [c for c in ("HWAD","GWAD") if c in plantgro.columns]
-            if not preferred:
-                numeric_cols = plantgro.select_dtypes(include=[np.number]).columns.tolist()
-                preferred = numeric_cols[:3]
-            for var in preferred:
-                try:
-                    plt.figure(figsize=(10,4))
-                    ax = plantgro[var].plot(title=f"{crop_name} - {var} over time")
-                    ax.set_xlabel("Date"); ax.set_ylabel(var)
-                    png = os.path.join(out_base,"plots", f"{crop_name}_{var}_{int(time.time())}.png")
-                    plt.tight_layout(); plt.savefig(png); plt.close()
-                    print(f"[OUTPUT] Saved plot: {png}")
-                except Exception as ex:
-                    print("[OUTPUT] Plot failed for", var, ex)
-        else:
-            print("[OUTPUT] Warning: no PlantGro output to save/plot.")
-
-        # close dssat
         try:
             dssat.close()
-            print("[DSSAT] DSSAT closed.")
         except Exception:
             pass
 
-        # Prepare summary
-        summary = {
+        return {
             "ok": True,
-            "lat": lat,
-            "lon": lon,
-            "crop": crop_name,
-            "planting_date": planting_date_str,
-            "predicted_yield_kg_ha": predicted_yield,
             "predicted_maturity_date": maturity_date.strftime("%Y-%m-%d") if maturity_date is not None else None,
-            "plantgro_csv": csv_path if csv_path else None,
-            "weather_csv": wth_out if wth_out else None,
-            "soil_sol": sol_path if sol_path and os.path.exists(sol_path) else None
+            "predicted_yield_kg_ha": predicted_yield
         }
-        # save summary json
-        summary_path = os.path.join(out_base, f"summary_{int(time.time())}.json")
-        with open(summary_path, "w") as jf:
-            json.dump(summary, jf, indent=2)
-        print(f"[OUTPUT] Saved pipeline summary JSON: {summary_path}")
-
-        # print output lines for farmer
-        print("\n===== RESULT =====")
-        if summary["predicted_maturity_date"]:
-            print("Predicted maturity date:", summary["predicted_maturity_date"])
-        else:
-            print("Predicted maturity date: (not available)")
-        if summary["predicted_yield_kg_ha"] is not None:
-            print("Predicted yield (kg/ha):", f"{summary['predicted_yield_kg_ha']:.2f}")
-        else:
-            print("Predicted yield: (not available)")
-
-        print("[RUN] Pipeline finished successfully.")
-        return summary
 
     except Exception as e:
-        print("[RUN] Pipeline error:", e)
-        traceback.print_exc()
-        return {"ok": False, "error": str(e)}
+        # Do not print; return error in structure
+        return {"ok": False, "error": "Pipeline exception."}
 
 # ---------- CLI ----------
 def main():
-    parser = argparse.ArgumentParser(description="Unified DSSAT orchestrator (verbose)")
+    parser = argparse.ArgumentParser(description="DSSAT minimal orchestrator (prints only final results)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--pin", help="Indian PIN code to geocode")
     group.add_argument("--latlon", nargs=2, type=float, metavar=("LAT","LON"), help="Latitude and longitude")
     parser.add_argument("--crop", required=True, help="Crop name recognizable by DSSATTools (e.g. wheat, rice)")
     parser.add_argument("--planting", required=True, help="Planting date YYYY-MM-DD")
-    parser.add_argument("--out", default=OUT_BASE, help="Output base folder")
     args = parser.parse_args()
 
     if args.pin:
-        summary = run_for_farmer(pin=args.pin, planting_date_str=args.planting, crop_name=args.crop, out_base=args.out)
+        summary = run_for_farmer(pin=args.pin, planting_date_str=args.planting, crop_name=args.crop)
     else:
-        summary = run_for_farmer(latlon=args.latlon, planting_date_str=args.planting, crop_name=args.crop, out_base=args.out)
+        summary = run_for_farmer(latlon=args.latlon, planting_date_str=args.planting, crop_name=args.crop)
 
-    if not summary.get("ok"):
-        print("\nPipeline failed. See logs printed above.")
+    # Print only two lines and nothing else
+    if summary.get("ok"):
+        print(f"Predicted maturity date: {summary.get('predicted_maturity_date')}")
+        py = summary.get("predicted_yield_kg_ha")
+        if py is None:
+            print("Predicted yield (kg/ha): None")
+        else:
+            # Format numeric yield to 2 decimal places
+            try:
+                print(f"Predicted yield (kg/ha): {float(py):.2f}")
+            except Exception:
+                print(f"Predicted yield (kg/ha): {py}")
     else:
-        print("\nPipeline succeeded. Outputs saved under:", args.out)
+        # If pipeline failed, still print the two lines as None to conform to requirement of "only two lines"
+        print("Predicted maturity date: None")
+        print("Predicted yield (kg/ha): None")
 
 if __name__ == "__main__":
     main()
